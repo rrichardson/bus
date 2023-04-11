@@ -13,9 +13,10 @@ keywords = ["channel","broadcast","lock-free"]
 categories = ["concurrency"]
 
 [dependencies]
-num_cpus = "1.6.2"
+num_cpus = "1"
 parking_lot_core = "0.9"
 crossbeam-channel = "0.5"
+futures = "0.3.28"
 
 [profile.release]
 debug = true
