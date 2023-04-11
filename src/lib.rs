@@ -101,15 +101,11 @@
 #![warn(rust_2018_idioms)]
 
 use crossbeam_channel as mpsc;
-use parking_lot_core::SpinWait;
 
-use futures::stream::Stream;
-use futures::task::AtomicWaker;
+use futures::{ready, stream::Stream, task::AtomicWaker};
 use std::cell::UnsafeCell;
 use std::fmt;
-use std::marker::PhantomData;
 use std::ops::Deref;
-use std::ptr;
 use std::sync::atomic;
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
@@ -368,7 +364,6 @@ impl<T> Bus<T> {
         let fence = (tail + 1) % self.state.len;
 
         // to avoid parking when a slot frees up quickly, we use an exponential back-off SpinWait.
-        let mut sw = SpinWait::new();
         let fence_read = self.state.ring[fence].read.load(atomic::Ordering::Acquire);
 
         // is there room left in the ring?
@@ -695,7 +690,6 @@ impl<T: Clone + Sync> BusReader<T> {
     /// `Err(mpsc::RecvTimeoutError::Timeout)` is returned. Otherwise, the current thread will be
     /// parked until there is another broadcast on the bus, at which point the receive will be
     /// performed.
-
     ///
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, std_mpsc::TryRecvError>> {
         if self.closed {
@@ -703,7 +697,6 @@ impl<T: Clone + Sync> BusReader<T> {
         }
 
         let mut was_closed = false;
-        let mut first = true;
         loop {
             let tail = self.bus.tail.load(atomic::Ordering::Acquire);
             if tail != self.head {
@@ -783,13 +776,12 @@ impl<T: Clone + Sync> BusReader<T> {
     ///
     /// j.join().unwrap();
     /// ```
-    fn try_recv(&mut self) -> Result<T, std_mpsc::TryRecvError> {
+    pub fn try_recv(&mut self) -> Result<T, std_mpsc::TryRecvError> {
         if self.closed {
             return Err(std_mpsc::TryRecvError::Disconnected);
         }
 
         let mut was_closed = false;
-        let mut first = true;
         loop {
             let tail = self.bus.tail.load(atomic::Ordering::Acquire);
             if tail != self.head {
@@ -850,55 +842,13 @@ impl<T> Drop for BusReader<T> {
     }
 }
 
-struct AtomicOption<T> {
-    ptr: atomic::AtomicPtr<T>,
-    _marker: PhantomData<Option<Box<T>>>,
-}
-
-impl<T> fmt::Debug for AtomicOption<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AtomicOption")
-            .field("ptr", &self.ptr)
-            .finish()
-    }
-}
-
-unsafe impl<T: Send> Send for AtomicOption<T> {}
-unsafe impl<T: Send> Sync for AtomicOption<T> {}
-
-impl<T> AtomicOption<T> {
-    fn empty() -> Self {
-        Self {
-            ptr: atomic::AtomicPtr::new(ptr::null_mut()),
-            _marker: PhantomData,
+impl<T: Clone + Sync> Stream for BusReader<T> {
+    type Item = T;
+    fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let me = self.get_mut();
+        match ready!(me.poll_recv(cx)) {
+            Ok(t) => Poll::Ready(Some(t)),
+            Err(_) => Poll::Ready(None),
         }
-    }
-
-    fn swap(&self, val: Option<Box<T>>) -> Option<Box<T>> {
-        let old = match val {
-            Some(val) => self.ptr.swap(Box::into_raw(val), atomic::Ordering::AcqRel),
-            // Acquire is needed to synchronize with the store of a non-null ptr, but since a null ptr
-            // will never be dereferenced, there is no need to synchronize the store of a null ptr.
-            None => self.ptr.swap(ptr::null_mut(), atomic::Ordering::Acquire),
-        };
-        if old.is_null() {
-            None
-        } else {
-            // SAFETY:
-            // - AcqRel/Acquire ensures that it does not read a pointer to potentially invalid memory.
-            // - We've checked that old is not null.
-            // - We do not store invalid pointers other than null in self.ptr.
-            Some(unsafe { Box::from_raw(old) })
-        }
-    }
-
-    fn take(&self) -> Option<Box<T>> {
-        self.swap(None)
-    }
-}
-
-impl<T> Drop for AtomicOption<T> {
-    fn drop(&mut self) {
-        drop(self.take());
     }
 }
