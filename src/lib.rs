@@ -105,7 +105,9 @@ use crossbeam_channel as mpsc;
 use futures::{ready, stream::Stream, task::AtomicWaker};
 use std::cell::UnsafeCell;
 use std::fmt;
+use std::future::Future;
 use std::ops::Deref;
+use std::pin::Pin;
 use std::sync::atomic;
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
@@ -199,10 +201,12 @@ impl<T: Clone + Sync> Seat<T> {
         // NOTE
         // we must extract the value *before* we decrement the number of remaining items otherwise,
         // the object might be replaced by the time we read it!
+        println!("read: {read}, state.max: {0}", state.max);
         let v = if read + 1 == state.max {
             // we're the last reader, so we may need to notify the writer there's space in the buf.
             // can be relaxed, since the acquire at the top already guarantees that we'll see
             // updates.
+            println!("taking seat waker");
             waiting = self.waker.take();
 
             // since we're the last reader, no-one else will be cloning this value, so we can
@@ -223,8 +227,10 @@ impl<T: Clone + Sync> Seat<T> {
 
         self.read.fetch_add(1, atomic::Ordering::AcqRel);
 
+        println!("took seat, checking waiting");
         if let Some(w) = waiting {
             // writer was waiting for us to finish with this
+            println!("signalling waker from seat");
             w.wake()
         }
 
@@ -353,7 +359,7 @@ impl<T> Bus<T> {
     /// again, and the broadcast will be tried again until it succeeds.
     ///
     /// Note that broadcasts will succeed even if there are no consumers!
-    fn poll_send(&mut self, val: T, cx: &mut Context<'_>) -> Poll<Result<(), T>> {
+    fn poll_send(&mut self, val: T, cx: &mut Context<'_>) -> Result<(), T> {
         let tail = self.state.tail.load(atomic::Ordering::Relaxed);
 
         // we want to check if the next element over is free to ensure that we always leave one
@@ -363,7 +369,6 @@ impl<T> Bus<T> {
         // reader).
         let fence = (tail + 1) % self.state.len;
 
-        // to avoid parking when a slot frees up quickly, we use an exponential back-off SpinWait.
         let fence_read = self.state.ring[fence].read.load(atomic::Ordering::Acquire);
 
         // is there room left in the ring?
@@ -385,6 +390,7 @@ impl<T> Bus<T> {
             // is the fence block now free?
             if fence_read != self.expected(fence) {
                 // no, so let's give up for now, but register to be awakened later
+                println!("registering with waker at fence: {fence}");
                 self.state.ring[fence].waker.register(cx.waker());
 
                 // need the atomic fetch_add to ensure reader threads will see the new .waiting
@@ -400,8 +406,8 @@ impl<T> Bus<T> {
                     thread::park_timeout(spintime);
                 }
                 */
+                return Err(val);
             }
-            return Poll::Pending;
         }
         // next one over is free, we have a free seat!
         let readers = self.readers;
@@ -427,12 +433,25 @@ impl<T> Bus<T> {
         self.rleft[tail] = 0;
         // now tell readers that they can read
         let tail = (tail + 1) % self.state.len;
+
+        // If we just filled up the queue, let's go ahead and register to be woken up now
+        // because the readers might starve us out if they consume all of the items before
+        // we wake
+        let fence = (tail + 1) % self.state.len;
+        let fence_read = self.state.ring[fence].read.load(atomic::Ordering::Acquire);
+        if fence_read != self.expected(fence) {
+            // no, so let's give up for now, but register to be awakened later
+            println!("precautionary registering with waker at fence: {fence}");
+            self.state.ring[fence].waker.register(cx.waker());
+        }
+
         self.state.tail.store(tail, atomic::Ordering::Release);
 
         // unblock any blocked receivers
         while let Ok((w, at)) = self.wake_receivers.1.try_recv() {
             // the only readers we can't unblock are those that have already absorbed the
             // broadcast we just made, since they are blocking on the *next* broadcast
+            println!("writer: listener at: {at}  vs tail: {tail}");
             if at == tail {
                 self.cache.push((w, at))
             } else {
@@ -444,7 +463,7 @@ impl<T> Bus<T> {
             self.wake_receivers.0.send(w).unwrap();
         }
 
-        Poll::Ready(Ok(()))
+        Ok(())
     }
 
     /// Attempts to place the given value on the bus.
@@ -555,6 +574,22 @@ impl<T> Bus<T> {
 
     /// Broadcasts a value on the bus to all consumers.
     ///
+    /// This function will asynchronously wait until space in the internal buffer becomes available.
+    ///
+    /// Note that a successful send does not guarantee that the receiver will ever see the data if
+    /// there is a buffer on this channel. Items may be enqueued in the internal buffer for the
+    /// receiver to receive at a later time. Furthermore, in contrast to regular channels, a bus is
+    /// *not* considered closed if there are no consumers, and thus broadcasts will continue to
+    /// succeed.
+    pub fn broadcast(&mut self, val: T) -> SendBroadcast<'_, T> {
+        SendBroadcast {
+            bus: self,
+            val: Some(val),
+        }
+    }
+
+    /// Broadcasts a value on the bus to all consumers.
+    ///
     /// This function will block until space in the internal buffer becomes available.
     ///
     /// Note that a successful send does not guarantee that the receiver will ever see the data if
@@ -562,12 +597,9 @@ impl<T> Bus<T> {
     /// receiver to receive at a later time. Furthermore, in contrast to regular channels, a bus is
     /// *not* considered closed if there are no consumers, and thus broadcasts will continue to
     /// succeed.
-    pub async fn broadcast(&mut self, val: T) -> Result<(), T> {
-        use std::future::poll_fn;
-        let mut v = Some(val);
-        poll_fn(|cx| self.poll_send(v.take().unwrap(), cx)).await
+    pub fn broadcast_blocking(&mut self, val: T) -> Result<(), T> {
+        futures::executor::block_on(async move { self.broadcast(val).await })
     }
-
     /// Add a new consumer to this bus.
     ///
     /// The new consumer will receive all *future* broadcasts on this bus.
@@ -639,6 +671,39 @@ impl<T> Drop for Bus<T> {
     }
 }
 
+/// Future that resolves to the result of `Bus::broadcast()`
+pub struct SendBroadcast<'a, T> {
+    val: Option<T>,
+    bus: &'a mut Bus<T>,
+}
+
+impl<T: Unpin> Unpin for SendBroadcast<'_, T> {}
+
+impl<F> fmt::Debug for SendBroadcast<'_, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SendBroadcast").finish()
+    }
+}
+
+impl<T> Future for SendBroadcast<'_, T> {
+    type Output = Result<(), T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = unsafe { &mut self.get_unchecked_mut() };
+        if let Some(val) = me.val.take() {
+            match me.bus.poll_send(val, cx) {
+                Ok(()) => Poll::Ready(Ok(())),
+                Err(val) => {
+                    me.val = Some(val);
+                    Poll::Pending
+                }
+            }
+        } else {
+            unimplemented!();
+        }
+    }
+}
+
 /// A `BusReader` is a single consumer of `Bus` broadcasts. It will see every new value that is
 /// passed to `.broadcast()` (or successful calls to `.try_broadcast()`) on the `Bus` that it was
 /// created from.
@@ -692,6 +757,7 @@ impl<T: Clone + Sync> BusReader<T> {
     /// performed.
     ///
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, std_mpsc::TryRecvError>> {
+        println!("Reader top of poll_recv");
         if self.closed {
             return Poll::Ready(Err(std_mpsc::TryRecvError::Disconnected));
         }
@@ -700,6 +766,7 @@ impl<T: Clone + Sync> BusReader<T> {
         loop {
             let tail = self.bus.tail.load(atomic::Ordering::Acquire);
             if tail != self.head {
+                println!("Reader tail: {tail} - head: {0}", self.head);
                 break;
             }
 
@@ -719,9 +786,11 @@ impl<T: Clone + Sync> BusReader<T> {
                 return Poll::Ready(Err(std_mpsc::TryRecvError::Disconnected));
             }
             //have it wake us up when data is available
+            println!("Reader registering for data");
             if let Err(..) = self.waiting.send((cx.waker().clone(), self.head)) {
                 // writer has gone away, but somehow we _just_ missed the close signal (in
                 // self.bus.closed). iterate again to ensure the channel is _actually_ empty.
+                println!("Reader:  writer has gone away?");
                 atomic::fence(atomic::Ordering::SeqCst);
                 continue;
             }
@@ -733,6 +802,12 @@ impl<T: Clone + Sync> BusReader<T> {
 
         // safe because len is read-only
         self.head = (head + 1) % self.bus.len;
+
+        let tail = self.bus.tail.load(atomic::Ordering::Acquire);
+        if tail != self.head {
+            println!("Reader precautionary registering for data");
+            let _ = self.waiting.send((cx.waker().clone(), self.head));
+        }
         Poll::Ready(Ok(ret))
     }
 
@@ -814,14 +889,29 @@ impl<T: Clone + Sync> BusReader<T> {
         Ok(ret)
     }
 
-    /// Read another broadcast message from the bus, and block if none are available.
+    /// Read a broadcast message from the bus, block the current thread if nothing is available.
     ///
-    /// This function will always block the current thread if there is no data available and it's
+    /// This function will block the current thread there is no data available and it's
     /// possible for more broadcasts to be sent. Once a broadcast is sent on the corresponding
     /// `Bus`, then this receiver will wake up and return that message.
     ///
     /// If the corresponding `Bus` has been dropped, or it is dropped while this call is blocking,
-    /// this call will wake up and return `Err` to indicate that no more messages can ever be
+    /// this call will wake up and return `None` to indicate that no more messages can ever be
+    /// received on this channel. However, since channels are buffered, messages sent before the
+    /// disconnect will still be properly received.
+    ///
+    pub fn recv_blocking(&mut self) -> Option<T> {
+        futures::executor::block_on(self.recv())
+    }
+
+    /// Read another broadcast message from the bus, asynchronously await if nothing is available
+    ///
+    /// This function will yield the current task if there is no data available and it's
+    /// possible for more broadcasts to be sent. Once a broadcast is sent on the corresponding
+    /// `Bus`, then this receiver will wake up and return that message.
+    ///
+    /// If the corresponding `Bus` has been dropped, or it is dropped while this call is blocking,
+    /// this call will wake up and return `None` to indicate that no more messages can ever be
     /// received on this channel. However, since channels are buffered, messages sent before the
     /// disconnect will still be properly received.
     pub async fn recv(&mut self) -> Option<T> {

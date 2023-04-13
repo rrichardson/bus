@@ -1,7 +1,8 @@
-extern crate bus;
+use bus;
 
 use std::sync::mpsc;
 use std::time;
+use futures::stream::StreamExt;
 
 #[test]
 fn it_works() {
@@ -16,14 +17,14 @@ fn it_works() {
 #[test]
 fn debug() {
     let mut c = bus::Bus::new(10);
-    println!("{:?}", c);
+    println!("{c:?}");
     let mut r = c.add_rx();
-    println!("{:?}", c);
-    println!("{:?}", r);
+    println!("{c:?}");
+    println!("{r:?}");
     assert_eq!(c.try_broadcast(true), Ok(()));
-    println!("{:?}", c);
+    println!("{c:?}");
     assert_eq!(r.try_recv(), Ok(true));
-    println!("{:?}", c);
+    println!("{c:?}");
 }
 
 #[test]
@@ -33,14 +34,14 @@ fn debug_not_inner() {
     struct Foo;
 
     let mut c = bus::Bus::new(10);
-    println!("{:?}", c);
+    println!("{c:?}");
     let mut r = c.add_rx();
-    println!("{:?}", c);
-    println!("{:?}", r);
+    println!("{c:?}");
+    println!("{r:?}");
     assert!(matches!(c.try_broadcast(Foo), Ok(())));
-    println!("{:?}", c);
+    println!("{c:?}");
     assert!(matches!(r.try_recv(), Ok(Foo)));
-    println!("{:?}", c);
+    println!("{c:?}");
 }
 
 #[test]
@@ -77,51 +78,50 @@ fn it_reads_when_full() {
     assert_eq!(r1.try_recv(), Ok(true));
 }
 
-#[test]
+#[tokio::test]
 #[cfg_attr(miri, ignore)]
-fn it_iterates() {
-    use std::thread;
+async fn it_streams() {
 
     let mut tx = bus::Bus::new(2);
     let mut rx = tx.add_rx();
-    let j = thread::spawn(move || {
+    let j = tokio::spawn(async move {
         for i in 0..1_000 {
-            tx.broadcast(i);
+            tx.broadcast(i).await.unwrap();
+            println!("just broadcast {i}");
         }
     });
 
     let mut ii = 0;
-    for i in rx.iter() {
+    while let Some(i) = rx.next().await {
+        println!("just read {i}");
         assert_eq!(i, ii);
         ii += 1;
     }
 
-    j.join().unwrap();
+    j.await.unwrap();
     assert_eq!(ii, 1_000);
     assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected));
 }
 
-#[test]
+#[tokio::test]
 #[cfg_attr(miri, ignore)]
-fn aggressive_iteration() {
+async fn aggressive_iteration() {
     for _ in 0..1_000 {
-        use std::thread;
-
         let mut tx = bus::Bus::new(2);
         let mut rx = tx.add_rx();
-        let j = thread::spawn(move || {
+        let j = tokio::spawn(async move {
             for i in 0..1_000 {
-                tx.broadcast(i);
+                tx.broadcast(i).await.unwrap();
             }
         });
 
         let mut ii = 0;
-        for i in rx.iter() {
+        while let Some(i) = rx.recv().await {
             assert_eq!(i, ii);
             ii += 1;
         }
-
-        j.join().unwrap();
+    
+        j.await.unwrap();
         assert_eq!(ii, 1_000);
         assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected));
     }
@@ -166,13 +166,13 @@ fn it_runs_blocked_writes() {
 
     let mut c = Box::new(bus::Bus::new(1));
     let mut r1 = c.add_rx();
-    c.broadcast(true); // this is fine
+    c.broadcast_blocking(true).unwrap(); // this is fine
 
     // buffer is now full
     assert_eq!(c.try_broadcast(false), Err(false));
     // start other thread that blocks
     let c = thread::spawn(move || {
-        c.broadcast(false);
+        c.broadcast_blocking(false).unwrap();
     });
     // unblock sender by receiving
     assert_eq!(r1.try_recv(), Ok(true));
@@ -181,41 +181,43 @@ fn it_runs_blocked_writes() {
     c.join().unwrap();
 }
 
-#[test]
+#[tokio::test]
 #[cfg_attr(miri, ignore)]
-fn it_runs_blocked_reads() {
+async fn it_runs_blocked_reads() {
     use std::sync::mpsc;
-    use std::thread;
 
     let mut tx = Box::new(bus::Bus::new(1));
     let mut rx = tx.add_rx();
     // buffer is now empty
     assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
     // start other thread that blocks
-    let c = thread::spawn(move || {
-        rx.recv().unwrap();
+    let c = tokio::spawn(async move {
+        rx.recv().await.unwrap();
     });
     // unblock receiver by broadcasting
-    tx.broadcast(true);
+    tx.broadcast(true).await.unwrap();
+    c.await.unwrap();
     // check that thread now finished
-    c.join().unwrap();
 }
 
 #[test]
 #[cfg_attr(miri, ignore)]
-fn it_can_count_to_10000() {
+fn it_can_count_to_10000_blocking() {
     use std::thread;
 
     let mut c = bus::Bus::new(2);
     let mut r1 = c.add_rx();
     let j = thread::spawn(move || {
         for i in 0..10_000 {
-            c.broadcast(i);
+            c.broadcast_blocking(i).unwrap();
+            println!("sent {i}");
         }
     });
 
     for i in 0..10_000 {
-        assert_eq!(r1.recv(), Ok(i));
+        let wat = r1.recv_blocking().unwrap();
+        assert_eq!(wat, i);
+        println!("received {wat}");
     }
 
     j.join().unwrap();
@@ -224,7 +226,7 @@ fn it_can_count_to_10000() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
-fn test_busy() {
+fn test_busy_threads() {
     use std::thread;
 
     // start a bus with limited space
@@ -234,7 +236,7 @@ fn test_busy() {
     let mut rx1 = bus.add_rx();
     let t1 = thread::spawn(move || {
         for _ in 0..5 {
-            rx1.recv().unwrap();
+            rx1.recv_blocking().unwrap();
         }
         drop(rx1);
     });
@@ -243,7 +245,7 @@ fn test_busy() {
     let mut rx2 = bus.add_rx();
     let t2 = thread::spawn(move || {
         for _ in 0..10 {
-            rx2.recv().unwrap();
+            rx2.recv_blocking().unwrap();
         }
         drop(rx2);
     });
@@ -256,12 +258,52 @@ fn test_busy() {
         std::thread::sleep(time::Duration::from_millis(100));
         match bus.try_broadcast(i) {
             Ok(_) => (),
-            Err(e) => println!("Broadcast failed {}", e),
+            Err(e) => println!("Broadcast failed {e}"),
         }
     }
 
     // done sending -- wait for receivers (which should already be done)
     t1.join().unwrap();
     t2.join().unwrap();
-    assert!(true);
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn test_busy_tasks() {
+    // start a bus with limited space
+    let mut bus = bus::Bus::new(1);
+
+    // first receiver only receives 5 items
+    let mut rx1 = bus.add_rx();
+    let t1 = tokio::spawn(async move {
+        for _ in 0..5 {
+            rx1.recv().await.unwrap();
+        }
+        drop(rx1);
+    });
+
+    // second receiver receives 10 items
+    let mut rx2 = bus.add_rx();
+    let t2 = tokio::spawn(async move {
+        for _ in 0..10 {
+            rx2.recv().await.unwrap();
+        }
+        drop(rx2);
+    });
+
+    // let receivers start
+    tokio::task::yield_now().await;
+
+    // try to send 25 items -- should work fine
+    for i in 0..25 {
+        tokio::task::yield_now().await;
+        match bus.try_broadcast(i) {
+            Ok(_) => (),
+            Err(e) => println!("Broadcast failed {e}"),
+        }
+    }
+
+    // done sending -- wait for receivers (which should already be done)
+    t1.await.unwrap();
+    t2.await.unwrap();
 }
