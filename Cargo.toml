@@ -13,9 +13,14 @@ keywords = ["channel","broadcast","lock-free"]
 categories = ["concurrency"]
 
 [dependencies]
-num_cpus = "1.6.2"
-parking_lot_core = "0.9"
+num_cpus = "1"
 crossbeam-channel = "0.5"
+futures = "0.3.28"
+
+[dev-dependencies]
+tokio = { version = "1.27.0", features = ["macros", "rt", "test-util"] }
+tokio-test = "0.4.2"
+
 
 [profile.release]
 debug = true
